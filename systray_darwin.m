@@ -1,6 +1,10 @@
 #import <Cocoa/Cocoa.h>
 #include "systray.h"
 
+static TrayAppDelegate *trayDelegate = nil;
+static NSCondition *nativeLoopCond = nil;
+static BOOL nativeLoopShouldExit = NO;
+
 #if __MAC_OS_X_VERSION_MIN_REQUIRED < 101400
 
     #ifndef NSControlStateValueOff
@@ -220,31 +224,56 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
 
 - (void) quit
 {
-  [NSApp terminate:self];
+  if (nativeLoopCond != nil) {
+    [nativeLoopCond lock];
+    nativeLoopShouldExit = YES;
+    [nativeLoopCond signal];
+    [nativeLoopCond unlock];
+  } else {
+    [NSApp terminate:self];
+  }
 }
 
 @end
 
 void registerSystray(void) {
-  TrayAppDelegate *delegate = [[TrayAppDelegate alloc] init];
-  [[NSApplication sharedApplication] setDelegate:delegate];
+  trayDelegate = [[TrayAppDelegate alloc] init];
+  // Only set delegate if none is set (e.g. Wails already has one)
+  if ([NSApp delegate] == nil) {
+    [[NSApplication sharedApplication] setDelegate:trayDelegate];
+  }
   // A workaround to avoid crashing on macOS versions before Catalina. Somehow
   // SIGSEGV would happen inside AppKit if [NSApp run] is called from a
   // different function, even if that function is called right after this.
   if (floor(NSAppKitVersionNumber) <= /*NSAppKitVersionNumber10_14*/ 1671){
-    [NSApp run];
+    if (![NSApp isRunning]) {
+      [NSApp run];
+    }
   }
+  // Application is already running (e.g. Wails), call ready directly
+  systray_ready();
 }
 
 int nativeLoop(void) {
   if (floor(NSAppKitVersionNumber) > /*NSAppKitVersionNumber10_14*/ 1671){
-    [NSApp run];
+    if ([NSApp isRunning]) {
+      // Wails (or another framework) is already running the app loop.
+      // Block on a condition variable instead of calling [NSApp run] again.
+      nativeLoopCond = [[NSCondition alloc] init];
+      [nativeLoopCond lock];
+      while (!nativeLoopShouldExit) {
+        [nativeLoopCond wait];
+      }
+      [nativeLoopCond unlock];
+    } else {
+      [NSApp run];
+    }
   }
   return EXIT_SUCCESS;
 }
 
 void runInMainThread(SEL method, id object) {
-  [(TrayAppDelegate*)[NSApp delegate]
+  [trayDelegate
     performSelectorOnMainThread:method
                      withObject:object
                   waitUntilDone: YES];
