@@ -53,6 +53,7 @@ withParentMenuId: (int)theParentMenuId
 @interface TrayAppDelegate: NSObject <NSApplicationDelegate>
   - (void) add_or_update_menu_item:(MenuItem*) item;
   - (IBAction)menuHandler:(id)sender;
+  - (void) initStatusItem;
   @property (assign) IBOutlet NSWindow *window;
   @end
 
@@ -69,8 +70,7 @@ static BOOL nativeLoopShouldExit = NO;
 
 @synthesize window = _window;
 
-- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
-{
+- (void)initStatusItem {
   self->statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
   self->menu = [[NSMenu alloc] init];
   [self->menu setAutoenablesItems: FALSE];
@@ -80,6 +80,11 @@ static BOOL nativeLoopShouldExit = NO;
   // Since the interface from Go is relatively simple, for now we ensure it's always
   // visible at application startup.
   self->statusItem.visible = TRUE;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
+{
+  [self initStatusItem];
   systray_ready();
 }
 
@@ -237,10 +242,22 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
 @end
 
 void registerSystray(void) {
+  if (![NSThread isMainThread]) {
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      registerSystray();
+    });
+    return;
+  }
+
   trayDelegate = [[TrayAppDelegate alloc] init];
   // Only set delegate if none is set (e.g. Wails already has one)
   if ([NSApp delegate] == nil) {
     [[NSApplication sharedApplication] setDelegate:trayDelegate];
+  } else {
+    // Wails or another framework already has a delegate.
+    // applicationDidFinishLaunching: won't be called for our delegate,
+    // so initialize the status item manually.
+    [trayDelegate initStatusItem];
   }
   // A workaround to avoid crashing on macOS versions before Catalina. Somehow
   // SIGSEGV would happen inside AppKit if [NSApp run] is called from a
