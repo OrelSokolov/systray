@@ -1,10 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #include "systray.h"
 
-static TrayAppDelegate *trayDelegate = nil;
-static NSCondition *nativeLoopCond = nil;
-static BOOL nativeLoopShouldExit = NO;
-
 #if __MAC_OS_X_VERSION_MIN_REQUIRED < 101400
 
     #ifndef NSControlStateValueOff
@@ -66,6 +62,10 @@ withParentMenuId: (int)theParentMenuId
   NSMenu *menu;
   NSCondition* cond;
 }
+
+static TrayAppDelegate *trayDelegate = nil;
+static NSCondition *nativeLoopCond = nil;
+static BOOL nativeLoopShouldExit = NO;
 
 @synthesize window = _window;
 
