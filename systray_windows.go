@@ -5,6 +5,7 @@ package systray
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -346,6 +347,7 @@ func (t *winTray) initInstance() error {
 
 	instanceHandle, _, err := pGetModuleHandle.Call(0)
 	if instanceHandle == 0 {
+		fmt.Fprintf(os.Stderr, "[systray-win] GetModuleHandle failed: %v\n", err)
 		return err
 	}
 	t.instance = windows.Handle(instanceHandle)
@@ -353,6 +355,7 @@ func (t *winTray) initInstance() error {
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms648072(v=vs.85).aspx
 	iconHandle, _, err := pLoadIcon.Call(0, uintptr(IDI_APPLICATION))
 	if iconHandle == 0 {
+		fmt.Fprintf(os.Stderr, "[systray-win] LoadIcon failed: %v\n", err)
 		return err
 	}
 	t.icon = windows.Handle(iconHandle)
@@ -360,17 +363,20 @@ func (t *winTray) initInstance() error {
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms648391(v=vs.85).aspx
 	cursorHandle, _, err := pLoadCursor.Call(0, uintptr(IDC_ARROW))
 	if cursorHandle == 0 {
+		fmt.Fprintf(os.Stderr, "[systray-win] LoadCursor failed: %v\n", err)
 		return err
 	}
 	t.cursor = windows.Handle(cursorHandle)
 
 	classNamePtr, err := windows.UTF16PtrFromString(className)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] UTF16PtrFromString(className) failed: %v\n", err)
 		return err
 	}
 
 	windowNamePtr, err := windows.UTF16PtrFromString(windowName)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] UTF16PtrFromString(windowName) failed: %v\n", err)
 		return err
 	}
 
@@ -385,6 +391,7 @@ func (t *winTray) initInstance() error {
 		IconSm:     t.icon,
 	}
 	if err := t.wcex.register(); err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] RegisterClassEx failed: %v\n", err)
 		return err
 	}
 
@@ -403,6 +410,7 @@ func (t *winTray) initInstance() error {
 		uintptr(0),
 	)
 	if windowHandle == 0 {
+		fmt.Fprintf(os.Stderr, "[systray-win] CreateWindowEx failed: %v\n", err)
 		return err
 	}
 	t.window = windows.Handle(windowHandle)
@@ -426,7 +434,12 @@ func (t *winTray) initInstance() error {
 	}
 	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
 
-	return t.nid.add()
+	if err := t.nid.add(); err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] Shell_NotifyIcon(NIM_ADD) failed: %v\n", err)
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[systray-win] Shell_NotifyIcon(NIM_ADD) ok\n")
+	return nil
 }
 
 func (t *winTray) createMenu() error {
@@ -765,15 +778,20 @@ func (t *winTray) iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
 }
 
 func registerSystray() {
+	fmt.Fprintf(os.Stderr, "[systray-win] registerSystray start\n")
 	if err := wt.initInstance(); err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] initInstance failed: %v\n", err)
 		log.Errorf("Unable to init instance: %v", err)
 		return
 	}
+	fmt.Fprintf(os.Stderr, "[systray-win] initInstance ok\n")
 
 	if err := wt.createMenu(); err != nil {
+		fmt.Fprintf(os.Stderr, "[systray-win] createMenu failed: %v\n", err)
 		log.Errorf("Unable to create menu: %v", err)
 		return
 	}
+	fmt.Fprintf(os.Stderr, "[systray-win] createMenu ok, calling systrayReady\n")
 
 	systrayReady()
 }
@@ -822,7 +840,9 @@ func quit() {
 func iconBytesToFilePath(iconBytes []byte) (string, error) {
 	bh := md5.Sum(iconBytes)
 	dataHash := hex.EncodeToString(bh[:])
-	iconFilePath := filepath.Join(os.TempDir(), "systray_temp_icon_"+dataHash)
+	// LoadImageW with LR_LOADFROMFILE may not detect the icon format when the
+	// file has no extension, so we keep the .ico suffix.
+	iconFilePath := filepath.Join(os.TempDir(), "systray_temp_icon_"+dataHash+".ico")
 
 	if _, err := os.Stat(iconFilePath); os.IsNotExist(err) {
 		if err := ioutil.WriteFile(iconFilePath, iconBytes, 0644); err != nil {

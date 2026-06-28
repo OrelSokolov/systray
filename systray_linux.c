@@ -2,6 +2,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #ifdef USE_LEGACY_APPINDICATOR
 #include <libappindicator/app-indicator.h>
@@ -14,7 +15,7 @@
 static AppIndicator *global_app_indicator;
 static GtkWidget *global_tray_menu = NULL;
 static GList *global_menu_items = NULL;
-static char temp_file_name[PATH_MAX] = "";
+static char icon_theme_path[PATH_MAX] = "";
 
 typedef struct {
 	GtkWidget *menu_item;
@@ -32,14 +33,37 @@ typedef struct {
 	short isCheckable;
 } MenuItemInfo;
 
+static void initIconThemePath(void) {
+	if (strlen(icon_theme_path) != 0) {
+		return;
+	}
+
+	const char *home = getenv("HOME");
+	if (home == NULL || home[0] == '\0') {
+		home = "/tmp";
+	}
+
+	int written = snprintf(icon_theme_path, PATH_MAX, "%s/.cache/quicgo-systray-icons", home);
+	if (written < 0 || written >= PATH_MAX) {
+		strncpy(icon_theme_path, "/tmp/quicgo-systray-icons", PATH_MAX-1);
+		icon_theme_path[PATH_MAX-1] = '\0';
+	}
+
+	if (g_mkdir_with_parents(icon_theme_path, 0755) == -1) {
+		printf("failed to create icon theme dir %s: %s\n", icon_theme_path, strerror(errno));
+	}
+}
+
 void registerSystray(void) {
 	gtk_init(0, NULL);
+	initIconThemePath();
 	global_app_indicator = g_object_new(APP_INDICATOR_TYPE,
 		"id", "systray",
 		"category", "ApplicationStatus",
 		"icon-name", "",
 		NULL);
 	app_indicator_set_status(global_app_indicator, APP_INDICATOR_STATUS_ACTIVE);
+	app_indicator_set_icon_theme_path(global_app_indicator, icon_theme_path);
 	global_tray_menu = gtk_menu_new();
 	app_indicator_set_menu(global_app_indicator, GTK_MENU(global_tray_menu));
 	systray_ready();
@@ -51,43 +75,60 @@ int nativeLoop(void) {
 	return 0;
 }
 
-void _unlink_temp_file() {
-	if (strlen(temp_file_name) != 0) {
-		int ret = unlink(temp_file_name);
-		if (ret == -1) {
-			printf("failed to remove temp icon file %s: %s\n", temp_file_name, strerror(errno));
-		}
-		temp_file_name[0] = '\0';
-	}
-}
-
 // runs in main thread, should always return FALSE to prevent gtk to execute it again
 gboolean do_set_icon(gpointer data) {
-	_unlink_temp_file();
+	GBytes* bytes = (GBytes*)data;
+	gsize size = 0;
+	gconstpointer icon_data = g_bytes_get_data(bytes, &size);
+
+	fprintf(stderr, "[systray] do_set_icon called, size=%zu\n", size);
+
 	char *tmpdir = getenv("TMPDIR");
 	if (NULL == tmpdir) {
 		tmpdir = "/tmp";
 	}
-	strncpy(temp_file_name, tmpdir, PATH_MAX-1);
-	strncat(temp_file_name, "/systray_XXXXXX", PATH_MAX-1);
-	temp_file_name[PATH_MAX-1] = '\0';
 
-	GBytes* bytes = (GBytes*)data;
-	int fd = mkstemp(temp_file_name);
+	char temp_path[PATH_MAX];
+	int written = snprintf(temp_path, PATH_MAX, "%s/systray_icon_XXXXXX", tmpdir);
+	if (written < 0 || written >= PATH_MAX) {
+		fprintf(stderr, "[systray] temp icon path too long\n");
+		g_bytes_unref(bytes);
+		return FALSE;
+	}
+
+	int fd = mkstemp(temp_path);
 	if (fd == -1) {
-		printf("failed to create temp icon file %s: %s\n", temp_file_name, strerror(errno));
+		fprintf(stderr, "[systray] failed to create temp icon file %s: %s\n", temp_path, strerror(errno));
+		g_bytes_unref(bytes);
 		return FALSE;
 	}
-	gsize size = 0;
-	gconstpointer icon_data = g_bytes_get_data(bytes, &size);
-	ssize_t written = write(fd, icon_data, size);
+	if (write(fd, icon_data, size) != (ssize_t)size) {
+		fprintf(stderr, "[systray] failed to write temp icon file %s: %s\n", temp_path, strerror(errno));
+		close(fd);
+		g_bytes_unref(bytes);
+		return FALSE;
+	}
 	close(fd);
-	if(written != size) {
-		printf("failed to write temp icon file %s: %s\n", temp_file_name, strerror(errno));
+
+	// AppIndicator needs a file extension to detect the image format.
+	char icon_file_path[PATH_MAX];
+	written = snprintf(icon_file_path, PATH_MAX, "%s.png", temp_path);
+	if (written < 0 || written >= PATH_MAX) {
+		fprintf(stderr, "[systray] final icon path too long\n");
+		unlink(temp_path);
+		g_bytes_unref(bytes);
 		return FALSE;
 	}
-	app_indicator_set_icon_full(global_app_indicator, temp_file_name, "");
-	app_indicator_set_attention_icon_full(global_app_indicator, temp_file_name, "");
+	if (rename(temp_path, icon_file_path) == -1) {
+		fprintf(stderr, "[systray] failed to rename %s to %s: %s\n", temp_path, icon_file_path, strerror(errno));
+		unlink(temp_path);
+		g_bytes_unref(bytes);
+		return FALSE;
+	}
+
+	fprintf(stderr, "[systray] setting icon from file: %s\n", icon_file_path);
+	app_indicator_set_icon_full(global_app_indicator, icon_file_path, "");
+	app_indicator_set_attention_icon_full(global_app_indicator, icon_file_path, "");
 	g_bytes_unref(bytes);
 	return FALSE;
 }
@@ -219,7 +260,6 @@ gboolean do_show_menu_item(gpointer data) {
 
 // runs in main thread, should always return FALSE to prevent gtk to execute it again
 gboolean do_quit(gpointer data) {
-	_unlink_temp_file();
 	// app indicator doesn't provide a way to remove it, hide it as a workaround
 	app_indicator_set_status(global_app_indicator, APP_INDICATOR_STATUS_PASSIVE);
 	gtk_main_quit();
