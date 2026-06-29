@@ -244,6 +244,15 @@ func (t *winTray) setTooltip(src string) error {
 
 var wt winTray
 
+// Tray icon modifications must happen on the thread that owns the tray window
+// and runs the message loop. WM_APP messages are private to this window.
+const wmSystraySetIcon = 0x8000 // WM_APP
+
+var (
+	pendingIcon   []byte
+	pendingIconMu sync.Mutex
+)
+
 // WindowProc callback function that processes messages sent to a window.
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms633573(v=vs.85).aspx
 func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam uintptr) (lResult uintptr) {
@@ -285,6 +294,19 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 		t.muNID.Lock()
 		t.nid.add()
 		t.muNID.Unlock()
+	case wmSystraySetIcon:
+		pendingIconMu.Lock()
+		icon := pendingIcon
+		pendingIcon = nil
+		pendingIconMu.Unlock()
+		if len(icon) > 0 {
+			iconFilePath, err := iconBytesToFilePath(icon)
+			if err != nil {
+				log.Errorf("Unable to write icon data to temp file: %v", err)
+			} else if err := t.setIcon(iconFilePath); err != nil {
+				log.Errorf("Unable to set icon: %v", err)
+			}
+		}
 	default:
 		// Calls the default window procedure to provide default processing for any window messages that an application does not process.
 		// https://msdn.microsoft.com/en-us/library/windows/desktop/ms633572(v=vs.85).aspx
@@ -320,7 +342,10 @@ func (t *winTray) initInstance() error {
 		CS_HREDRAW = 0x0002
 		CS_VREDRAW = 0x0001
 	)
-	const NIF_MESSAGE = 0x00000001
+	const (
+		NIF_MESSAGE = 0x00000001
+		NIF_ICON    = 0x00000002
+	)
 
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms644931(v=vs.85).aspx
 	const WM_USER = 0x0400
@@ -432,6 +457,25 @@ func (t *winTray) initInstance() error {
 		Flags:           NIF_MESSAGE,
 		CallbackMessage: t.wmSystrayMessage,
 	}
+
+	// Apply any icon that was set before the tray window was created so the
+	// very first Shell_NotifyIcon(NIM_ADD) already shows the icon.
+	pendingIconMu.Lock()
+	icon := pendingIcon
+	pendingIcon = nil
+	pendingIconMu.Unlock()
+	if len(icon) > 0 {
+		iconFilePath, err := iconBytesToFilePath(icon)
+		if err != nil {
+			log.Errorf("Unable to write icon data to temp file: %v", err)
+		} else if h, err := t.loadIconFrom(iconFilePath); err != nil {
+			log.Errorf("Unable to load icon from temp file: %v", err)
+		} else {
+			t.nid.Icon = h
+			t.nid.Flags |= NIF_ICON
+		}
+	}
+
 	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
 
 	if err := t.nid.add(); err != nil {
@@ -856,15 +900,29 @@ func iconBytesToFilePath(iconBytes []byte) (string, error) {
 // iconBytes should be the content of .ico for windows and .ico/.jpg/.png
 // for other platforms.
 func SetIcon(iconBytes []byte) {
-	iconFilePath, err := iconBytesToFilePath(iconBytes)
-	if err != nil {
-		log.Errorf("Unable to write icon data to temp file: %v", err)
+	if len(iconBytes) == 0 {
 		return
 	}
-	if err := wt.setIcon(iconFilePath); err != nil {
-		log.Errorf("Unable to set icon: %v", err)
+
+	// Shell_NotifyIcon updates must be issued from the thread that owns the
+	// tray window. Store the bytes and ask the message loop to apply them.
+	pendingIconMu.Lock()
+	pendingIcon = iconBytes
+	pendingIconMu.Unlock()
+
+	// If the tray window doesn't exist yet, the bytes stay in pendingIcon and
+	// registerSystray will apply them during NIM_ADD. Otherwise post a message
+	// so the actual Shell_NotifyIcon call happens on the message-loop thread.
+	if wt.window == 0 {
 		return
 	}
+
+	pPostMessage.Call(
+		uintptr(wt.window),
+		uintptr(wmSystraySetIcon),
+		0,
+		0,
+	)
 }
 
 // SetTemplateIcon sets the systray icon as a template icon (on macOS), falling back
